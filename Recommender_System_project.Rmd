@@ -467,10 +467,6 @@ plot(my_seq, LIBMF_rmse_vector, type =  "b", xlab = "Minimum Number of ratings",
 
 
 
-#comment on the pro and cons of every method
-#do a hockey stick for the performance of each model 
-# validate the pro and cons using the data 
-
 ## Example
 
 movie_ratings[410,]
@@ -479,4 +475,3 @@ as(recommended.items.u410, "list")[[1]]
 
 
 
-#For the conclusion regarding the evaluation, there is a point to make that just assessing statistical rigor is not great. For instance, 
