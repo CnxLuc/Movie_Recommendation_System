@@ -1,29 +1,11 @@
----
-title: "Data Science 2: Assignment 2"
-author: "Luc de Leyritz"
-date: "`r Sys.Date()`"
-output:
-    html_document:
-      number_sections: true
-      highlight: haddock
-      theme: spacelab
-      toc: yes
-      toc_depth: 2
-      toc_float:
-        collapsed: false
-    
----
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
 ### Building Recommender Systems
 
 Technology creates options, especially when it comes to content. The internet with services such as Netflix and self-services such as The Pirate Bay, multiplied the number movies we can watch. Choice is good, but too much choice can be overwhelming. This - and other economical reasons - prompted contet plateforms such as Youtube or Netflix to develop powerful recommender algorithms that reduce the thousand of availbale to choices to a shortlist of the movies it reckons you might enjoy the most. 
 
 But in much the same fashion that more choice does not make you more free, choosing among a list coming out of of an opaque algorithm is not optimal either. That's why in this project we will build 3 different recommender systems, see what kind of movies they output and choose the best. Our decision criteria will be :
 
-- Variety of movies recommeded
+- Variety of movies recommended
 - Relevance of the movies (some movies must be somewhat known)
 - Coherence of the recommendendations 
 - Statistical measure of performance (RMSE)
