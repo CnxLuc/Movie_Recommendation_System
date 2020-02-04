@@ -1,0 +1,500 @@
+---
+title: "Data Science 2: Assignment 2"
+author: "Luc de Leyritz"
+date: "`r Sys.Date()`"
+output:
+    html_document:
+      number_sections: true
+      highlight: haddock
+      theme: spacelab
+      toc: yes
+      toc_depth: 2
+      toc_float:
+        collapsed: false
+    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+### Building Recommender Systems
+
+Technology creates options, especially when it comes to content. The internet with services such as Netflix and self-services such as The Pirate Bay, multiplied the number movies we can watch. Choice is good, but too much choice can be overwhelming. This - and other economical reasons - prompted contet plateforms such as Youtube or Netflix to develop powerful recommender algorithms that reduce the thousand of availbale to choices to a shortlist of the movies it reckons you might enjoy the most. 
+
+But in much the same fashion that more choice does not make you more free, choosing among a list coming out of of an opaque algorithm is not optimal either. That's why in this project we will build 3 different recommender systems, see what kind of movies they output and choose the best. Our decision criteria will be :
+
+- Variety of movies recommeded
+- Relevance of the movies (some movies must be somewhat known)
+- Coherence of the recommendendations 
+- Statistical measure of performance (RMSE)
+
+```{r loading libraries, echo=TRUE, message=FALSE, warning=FALSE}
+library(recommenderlab) #to build the recommmender model
+library(ggplot2)                       
+library(data.table) #to perform efficient aggregation operations on a large dataset
+library(reshape2)
+library(tidyverse)
+```
+
+# ICE
+
+Before modelling and coming up with our recommendation engines, we need to take a look at the data we have on movies and their ratings, understand its structure, and eventually modify it.
+
+## Loading the Data
+```{r loading data, echo=TRUE, message=FALSE, warning=FALSE}
+#We import the different databases we will use to build our models
+movie_data <- fread("movies.csv") #using readr to optimizes the speed to load the data
+rating_data_raw <- fread("ratings.csv", nrows = 1e6, select= c(1:3)) #We select only 1M Observation to make our analysis and model building tractable
+```
+Our recommender system is a model that uses ratings as an input (predictor variable) and outputs a recommendation. As a result, the rating_data is a critical piece of our analysis. This data set gives us for each user (with a unique userId) and movie (unique movieId), a rating that corresponds to the user's evaluation of the movie. The movie ratings are made on a 5-star scale, with half-star increments (0.5 stars - 5.0 stars). 
+
+It is important to see how NA value are treated in this data. The ratings start at 0.5, which meas that NA are automatically deleted: if a user or a movie appears in the database they have given/received at least one rating.
+
+This raw dataset is not very useful at this point because the movie ID is not very informative. I wouldn't be able to look up the movie ID in netflix to watch the movies recommended by the Recommender System (RS). This is why the movie_data set comes in useful.
+```{r E, echo=TRUE, warning=TRUE}
+glimpse(rating_data_raw) #we look at the rating_data structure
+glimpse(movie_data)
+```
+
+The movie_data set matches the movie titles to the IDs provided in the above data set. They are entered manually or imported from <https://www.themoviedb.org/>, and include the year of release in parentheses.
+
+The above dataset are the key components of our analysis since they are the raw materials upon which we can build the recommender model. All we need is a user/item matrix, with the ratings, and the previous datasets gives us exctly that.
+
+However, we may improve the model with additional data sources which we could explore after building the model.
+
+- *The tag genome* is a data structure that contains tag relevance scores for movies. The structure is a  matrix: each movie in the genome has a value for each tag in the genome.
+
+- The *links* data provides us with links to other sources of movie data. Each line of this file after the header row represents one movie, and features links to IMDB, and TMDD.
+
+- *Tags* are user-generated metadata about movies. They are typically a single word or short phrase which meaning, value, and purpose is determined by each user.
+
+
+## Data Cleaning
+Let's now explore the basics of the data:
+
+The original dataset has 27,753,444 ratings, made by 283,228 unique users. Our movie dataset includes 58,098 movies, but only 53,889 are rated. The dataset we are working with has 10,000,000 ratings made by 103,009 unique users, on 40,985 movies.
+
+In addition, in the movie data, there are some duplicates: there are a number of movies with different IDs but the same title. For instance, there are two movies called "War of the Worlds (2005)", with different movie ID. There are 78 duplicated movies.
+
+```{r data inspection, echo=TRUE, message=FALSE, warning=FALSE}
+# For how many movies/users do I have ratings ?
+length(unique(rating_data_raw$userId))
+length(unique(rating_data_raw$movieId))
+#There are 1,000,000 ratings made by 10,073 unique users, on 22,031 movies.
+
+#We check wether some movies occur more than twice in the movie dataset
+length(unique(movie_data$title))
+#there are 58,020 unique movie titles and 58,098 movie ID, which means that some movies appear more than once. We will get rid of them in the later stages of the data cleaning.
+```
+
+
+###Cleaning movie data
+
+We first deal with the duplicates and  remove those movies that are not rated from movie_data.
+```{r}
+#Getting rid of the repeated titles in movie_data
+repeatMovies <- names(which(table(movie_data$title) > 1)) #vector of repeated movie names
+removeRows <- integer() #create a vector in which we feed the repeated rows
+for(i in repeatMovies){ #the iterates goes through the vector of repeated movie
+  repeatMovieLoc <- which(movie_data$title == i)
+  tempGenre <- paste(movie_data$genres[repeatMovieLoc], collapse="|")
+  tempGenre <- paste(unique(unlist(strsplit(tempGenre, split = "\\|")[[1]])), collapse = "|") 
+  movie_data$genres[repeatMovieLoc[1]] <- tempGenre #replace genre in the first location
+  removeRows <- c(removeRows, repeatMovieLoc[-1])
+  
+#Removing repeat rows in the rating data
+repeatMovieIdLoc <- which(rating_data_raw$movieId %in% movie_data$movieId[removeRows]) # %in% is to match the rows, to find the rows to remove
+
+  rating_data_raw$movieId[repeatMovieIdLoc] <- movie_data$movieId[repeatMovieLoc[1]] #we find the locations of the repeated movie and force the initial movie ID into them
+}
+
+movie_data$movieId[removeRows]
+movie_data <- movie_data[-removeRows,]
+rm(i, removeRows, repeatMovieIdLoc, repeatMovieLoc, repeatMovies, tempGenre)
+
+```
+
+###Cleaning rating_data
+
+One risk we have to adress is wether some users have rated the same movie more than once. If this is the case, this will be problematic for our user/item matrix, so we will take care of it in this data preparation step.
+```{r}
+#If a user has rated the same movie multiple times, we will take the best rating
+rating_data_clean <- rating_data_raw %>% 
+  group_by(userId,movieId) %>% 
+  summarise(rating = max(rating))
+#We go from 1,000,000 to 999,973, because 27 users rated the same movie multiple times.
+```
+
+Now, we look at the number of ratings that each movie has received and each user has given.
+```{r}
+rating_subset_data <- rating_data_clean %>% 
+  group_by(movieId) %>% #we start by grouping by movies to compute the number 
+  mutate(number_of_ratings_movie = n()) %>% 
+  ungroup() %>% 
+  group_by(userId) %>% #then we do a similar operation to the users, selecting the users based on the number of rating they give
+  mutate(number_of_ratings_user = n())
+
+rating_data_clean %>%  
+  group_by(movieId) %>% 
+  summarise(mean_rating = mean(rating)) %>% 
+  ggplot(aes(x = mean_rating))+ #plotting the distribution of movies mean rating
+  geom_histogram()
+
+rating_data_clean %>%  
+  group_by(movieId) %>% 
+  summarise(mean_rating = mean(rating)) %>% 
+  arrange(desc(mean_rating)) %>% 
+  head(5) #we look at 5 of the top rated movies
+
+```
+The distribution of average ratings shows outliers, especially towards movies rated 5 stars, which seems unlikely. We would expect very good movies to be rare exceptions.
+
+If we pick randomly five movies in this surprisingly big pool of outstanding movies, we end up with : 
+
+- Hijacking Catastrophe: 9/11, Fear & the Selling of American Empire (2004)
+- Latin Music USA (2009)
+- Keeping the Promise (Sign of the Beaver, The) (1997)
+- Best of Ernie and Bert, The (1988)
+- Junior Prom (1946)
+
+These are not exactly the kind of movies we would expect. The explanation for these surprisingly high ratings is that these movies were rated by very few users. This leads us to a important part of our data preparation: we will have to set thresholds for the minimum number of ratings given/received for users and movies. Setting the right number will help us overcome the cold start problem that we see here: with very little ratings some movies end up with ratings that do not reflect the value users give it. 
+
+The treshold we choose will bear a strong impact on model performance, and we have to understand how to select the best model. We will take care of this at the end of data preparation. 
+
+```{r}
+# we get rid of the movies in movie_data that are not in our working sample
+movie_data_clean <- movie_data %>% 
+filter(movieId %in% rating_data_clean$movieId)
+
+#we merge the datasets
+recommender_data <- merge(x = rating_data_clean, y = movie_data, by = "movieId", all.x = TRUE)
+
+#we get rid of the genre and movieId columns
+recommender_data <- recommender_data %>% 
+  select(-movieId, -genres)
+```
+
+
+We now have a subset of our clean data, but to create our recommender system we need to put this data in a matrix format, specifically a rating matrix format.
+
+```{r}
+#we create a matrix of users and movies with UserIds as rows and MovieIds as columns
+ratingMatrix <- dcast.data.table(data.table(recommender_data), userId ~ title, value.var = "rating", na.rm=TRUE)
+ratingMatrix <- as.matrix(ratingMatrix[,-1]) # we remove userIds
+dim(ratingMatrix)
+
+#Convert rating matrix into a recommenderlab sparse matrix
+ratingMatrix <- as(ratingMatrix, "realRatingMatrix") #convert the rating matrix into a realRatingMatrix. We create a class/struct, a new object
+ratingMatrix
+# 10073 x 22022 rating matrix of class ‘realRatingMatrix’ with 999973 ratings.
+```
+
+## EDA
+
+Now that we have a working matrix and database, let's explore the matrix to get a sense of what the recommender engine will be able to do.
+
+```{r}
+
+#we look at the most rated movies in our matrix 
+ratings_per_movie <- colCounts(ratingMatrix) #we start by counting the ratings
+
+#the we sort the movies by the number of ratings 
+most_rated_movie_table <- data.frame(
+  movie = names(ratings_per_movie),
+  ratings = ratings_per_movie
+  )
+
+most_rated_movie_table  <- most_rated_movie_table[order(most_rated_movie_table$ratings, decreasing = TRUE), ]
+
+#now we graph the top 10 movies
+
+ggplot(most_rated_movie_table[1:10, ], aes(x = movie, y = ratings)) + geom_bar(stat="identity") + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ggtitle("Number of views of the top movies")
+```
+We see that the movies with the highest number of views are well-kown name, blockbusters or very popular movies that have been aroud from quite some time. That's a good sign that our database is representative of what people watch, but that also prompts us to be wary of a model that would only recommend those movies, as it would be useless.
+
+```{r}
+#now, let's visualize our matrix, using a heatmap 
+image(ratingMatrix[1:150, 1:200], main = "Heatmap of the rating matrix")
+# It's a very sparse matrix, which was to be expected. It is hard to read so we will focus on a few rows for the sake of interpretability
+
+#we look at the rating matrix for the top 15 users and top 20 movies
+
+min_movies <- quantile(rowCounts(ratingMatrix), 0.999) 
+min_users <- quantile(colCounts(ratingMatrix), 0.999)
+
+image(ratingMatrix[rowCounts(ratingMatrix) > min_movies, colCounts(ratingMatrix) > min_users], main = "Heatmap of the top users and movies")
+```
+We see that some users give more ratings than others. There also seems to be enough data points to see some trends appear: we can see that user 2 and 5 have given the same ratinng to a number of movies, so we might infer that user 5 would also like movie n°1 that user 2 has rated highly. 
+
+The matrix we just saw are very sparse, so we will select a minimum number of ratings given/received for movies and users. We select this number arbitrarily, but later on in the analysis we will see the impact it bears on the recommender model and select the appropriate number.
+```{r}
+ratingMatrixSubset <- ratingMatrix[rowCounts(ratingMatrix) > 50,
+                              colCounts(ratingMatrix) > 50]
+
+dim(ratingMatrixSubset)
+```
+
+
+## Collaborative Filtering Recommendation System
+
+The pattern we just saw indicates that we could look at the similarity between users, as evidenced by the similar - or dissimilar - ratings they give to the same movies to recommend movies. This is called user-based collaborative filtering, i.e. recommending items to a user based on other user's preferences.
+
+We can think of this approach as word-to-mouth: when my friend who enjoys the same movies as I do gives me a movie suggestion, there is a reasonable chance that I will enjoy the movie as well. This is User-based collaborative filtering.
+
+But we can also think of it in term of movies: if I like 10 movies of a certain nature, an 11th movie that would be recommended to me based on its degree of similarity to the previous movies has reasonable chances of being a good recommendation. Item-based collaborative filtering looks at the items that a given user likes, and recommends similar items.
+
+Before we build any recommendation engine, we have to split the data into a training and testing set. We will train the data on the training set and output recommendations for the users in the testing set.
+```{r}
+## Here we split our sample into train and test. We intend to train our model on 80% of the data. And, test the model on the remaining 20%
+sampled_data<- sample(x = c(TRUE, FALSE), #we create a vector sampled_data with the logical vectors true/false that we will use to partition the data
+                      size = nrow(ratingMatrixSubset),
+                      replace = TRUE,
+                      prob = c(0.8, 0.2))
+
+training_data <- ratingMatrixSubset[sampled_data, ]#we partition using our sample
+testing_data <- ratingMatrixSubset[!sampled_data, ]
+```
+
+# User-based collaborative filtering
+
+This algorithm will output movie recommendation based on the user/item rating matrix. To do so, we :
+
+  1. We measures the degree of similarity of each users to the user of the algorithm, using cosine (dot-product) as a measure of similarity
+
+  2. We will then select a number of users deemed similar enough and look at the rating they give to the movies they have viewed
+
+  3. From this list we will pick the top rated items that our user has not seen.
+
+
+```{r}
+
+#we will use the system default parameters, i.e. we will retain the top 25 most similar users ($nn = 25), using cosine as our measure of similarity.
+recommendation_system <- recommenderRegistry$get_entries(dataType ="realRatingMatrix")
+recommendation_system$UBCF_realRatingMatrix$parameters
+
+UBCF_movie_model <- Recommender(data = training_data, 
+                                method = "UBCF")
+
+#we will now use the model to find the top 5 recommendations for the users in the testing set
+UBCF_predicted <- predict(object = UBCF_movie_model, newdata = testing_data, n = 5) 
+#we create a matrix with the recommendations
+recc_matrix_ubcf <- sapply(UBCF_predicted@items, function(x){ colnames(ratingMatrixSubset)[x] }) 
+
+
+#let's look at the recommendation for the first 5 users 
+recc_matrix_ubcf[, 1:5]
+```
+Our model gives us 5 movies recommendations per user. Let's look at the recommendation for user n°5 :
+
+[1] "Pirates of the Caribbean: At World's End (2007)" 
+[2] "Harry Potter and the Order of the Phoenix (2007)"
+[3] "Iron Man (2008)"                                 
+[4] "WALL·E (2008)"                                   
+[5] "Harry Potter and the Half-Blood Prince (2009)" 
+
+From this list we can already see wether our model might respect the conditions we set earlier:
+- we can see that the movies are relevant, they are all well known movies. On the minus side, we might fear that the model only recommends blockbusters
+- The recommendations are coherent, our user is clearly into adventure movies and most movies fit the bill. In addition, when the model recommends one Harry Potter Movie, it recommends 
+
+We can see that some movies are recommended more than once, so we will explore a bit further which movies are suggested and how may times they are suggested.
+
+```{r}
+number_of_recc_ubcf <- factor(table(recc_matrix_ubcf))
+number_of_recc_ubcf <- sort(number_of_recc_ubcf, decreasing = TRUE)
+top_10_recc_ubcf <- head(number_of_recc_ubcf, 10)
+table_top_recc_ubcf <- data.frame(names(top_10_recc_ubcf), top_10_recc_ubcf)
+
+ggplot(table_top_recc_ubcf, aes(x = names.top_10_recc_ubcf., y = top_10_recc_ubcf))+
+  geom_col()+
+  labs(title    = "Most recommended titles for UBCF",
+       x        = "",
+       y        = "Number of Recommendations")+
+  theme(axis.text.x = element_text(angle = 70, vjust=0.6))
+  
+
+qplot(number_of_recc_ubcf) + ggtitle("Distribution of the number of items for UBCF")
+```
+We can see that a few movies are recommended over and over. This is a good indicator of our model's quality, as it should not only recommend blockbusters, but tailor the recommendations to the users. We see here that it does so, as tha majority of movies are recommended betwee 1 and 7 times. 
+
+We will now compare the results of this system to those of another approach in which we base our recommedation on the similarity of items rather than the similarity of users.
+
+### Item-based Collaborative Filtering 
+
+In this approach, rather tha looking at a user and suggesting movie based on what similar user like, we look at the user's watch history and based on her past ratings, we suggest movies that are the most similar to those she rated highly.
+
+```{r}
+# Now we train an item-based CF model
+IBCF_movie_model <- Recommender(data = training_data,
+                              method = "IBCF",
+                              parameter = list(k = 30))
+
+
+IBCF_predicted <- predict(object = IBCF_movie_model,
+                                     newdata = testing_data,
+                                     n = 5)
+
+IBCF_recommendation_matrix <- sapply(IBCF_predicted@items, function(x){ colnames(ratingMatrixSubset)[x]})
+
+
+# matrix with the recommendations for each user
+IBCF_recommendation_matrix[, 1:5]
+```
+
+```{r}
+number_of_recc_ibcf <- factor(table(IBCF_recommendation_matrix))
+number_of_recc_ibcf <- sort(number_of_recc_ibcf, decreasing = TRUE)
+top_10_recc_ibcf <- head(number_of_recc_ibcf, 10)
+table_top_recc_ibcf <- data.frame(names(top_10_recc_ibcf), top_10_recc_ibcf)
+
+ggplot(table_top_recc_ibcf, aes(x = names.top_10_recc_ibcf., y = top_10_recc_ibcf))+
+  geom_col()+
+  labs(title    = "Most recommended titles for IBCF",
+       x        = "",
+       y        = "Number of Recommendations")+
+  theme(axis.text.x = element_text(angle = 70, vjust=0.6))
+  
+
+qplot(number_of_recc_ibcf) + ggtitle("Distribution of the number of items for IBCF")
+```
+
+```{r}
+
+LIBMF_movie_model <- Recommender(data = training_data, 
+                                method = "LIBMF")
+
+#we will now use the model to find the top 5 recommendations for the users in the testing set
+LIBMF_predicted <- predict(object = LIBMF_movie_model, newdata = testing_data, n = 5) 
+#we create a matrix with the recommendations
+recc_matrix_libmf <- sapply(LIBMF_predicted@items, function(x){ colnames(ratingMatrixSubset)[x] }) 
+
+#let's look at the first 5 users 
+recc_matrix_libmf[, 1:5]
+```
+
+```{r}
+number_of_recc_libmf <- factor(table(recc_matrix_libmf))
+number_of_recc_libmf <- sort(number_of_recc_libmf, decreasing = TRUE)
+top_10_recc_libmf <- head(number_of_recc_libmf, 10)
+table_top_recc_libmf <- data.frame(names(top_10_recc_libmf), top_10_recc_libmf)
+
+ggplot(table_top_recc_libmf, aes(x = names.top_10_recc_libmf., y = top_10_recc_libmf))+
+  geom_col()+
+  labs(title    = "Most recommended titles for LIBMF",
+       x        = "",
+       y        = "Number of Recommendations")+
+  theme(axis.text.x = element_text(angle = 70, vjust=0.6))
+  
+
+qplot(number_of_recc_libmf) + ggtitle("Distribution of the number of items for LIBMF")
+```
+This model has more movies that get recommended over and over, so it will definitely be more blockbuster oriented than the previous two models.
+
+From what we see, and according to the initially stated criteria, the model we favor is UBCF. But we will now have to make sure of the different models' performance when we use different thresholds. 
+
+#### MODEL EVALUATION AND THRESHOLD SELECTION
+
+We will evaluate the models by looking at the predicted ratings they output. They use these predicted ratings by selecting the movies with the best predicted ratings to recommend them. We will evaluate how accurate those ratings are by looking at the RMSE (i.e. Root Mean Square Error).
+
+We use a for loop to select different values for the lower bound on the number of ratings given/received and see how it affects our models' RMSE. 
+
+```{r}
+#We first set up a for loop for the UBCF model
+
+UBCF_rmse_vector <- numeric(0) #creating an empty vector that will be contain the different RMSE values
+my_seq <- seq(50, 1300, by = 50) #we will start with a treshold of 50 ratings given/received and iterate until a lower bound of 1600
+
+for (i in my_seq) {
+  ratingMatrix_UBCF <- ratingMatrix[rowCounts(ratingMatrix) > i,
+                              colCounts(ratingMatrix) > i]
+
+  eval_sets <- evaluationScheme(data = ratingMatrix_UBCF, method = "split", train = 0.8, given = 5)
+
+  UBCF_eval <- Recommender(getData(eval_sets, "train"), method = "UBCF",
+                          param=list(normalize = "center", method="Cosine", nn=25))
+  UBCF_prediction <- predict(UBCF_eval, getData(eval_sets, "known"), type="ratings")
+
+  rmse_ubcf <- calcPredictionAccuracy(UBCF_prediction, getData(eval_sets, "unknown"))[1]
+  UBCF_rmse_vector <- c(UBCF_rmse_vector, rmse_ubcf[1])
+}
+
+UBCF_rmse_vector
+```
+
+We then fill a second vector with the IBCF model's evaluation.
+
+```{r}
+#Now for the IBCF model
+
+  
+  IBCF_rmse_vector <- numeric(0)
+  my_seq <- seq(50, 1300, by = 50)
+
+for (i in my_seq) {
+  
+  ratingMatrix_ibcf <- ratingMatrix[rowCounts(ratingMatrix) > i,
+                              colCounts(ratingMatrix) > i]
+  
+  eval_sets <- evaluationScheme(data = ratingMatrix_ibcf, method = "split", train = 0.8, given = 5)
+  
+  IBCF_eval <- Recommender(getData(eval_sets, "train"), method = "IBCF")
+  IBCF_prediction <- predict(IBCF_eval, getData(eval_sets, "known"), type="ratings")
+  
+  rmse_ibcf <- calcPredictionAccuracy(IBCF_prediction, getData(eval_sets, "unknown"))[1]
+  
+  IBCF_rmse_vector <- c(IBCF_rmse_vector, rmse_ibcf[1])
+}
+
+IBCF_rmse_vector
+
+```
+
+Finnally we look at the third, matrix factorization model.
+```{r}
+#ow for the LIMBCF model
+
+LIBMF_rmse_vector <- numeric(0)
+
+my_seq <- seq(50, 1300, by = 50)
+
+for (i in my_seq) {
+  
+  ratingMatrix_LIBMF <- ratingMatrix[rowCounts(ratingMatrix) > i,
+                              colCounts(ratingMatrix) > i]
+  
+  eval_sets <- evaluationScheme(data = ratingMatrix_LIBMF, method = "split", train = 0.8, given = 5)
+  
+  LIBMF_eval <- Recommender(getData(eval_sets, "train"), method = "LIBMF")
+  LIBMF_prediction <- predict(LIBMF_eval, getData(eval_sets, "known"), type="ratings")
+  
+  rmse_LIBMF <- calcPredictionAccuracy(LIBMF_prediction, getData(eval_sets, "unknown"))[1]
+  
+  LIBMF_rmse_vector <- c(LIBMF_rmse_vector, rmse_LIBMF)
+}
+
+LIBMF_rmse_vector
+```
+
+
+We now plot the different RMSE to see how model performance evolves with the threshold we choose.
+```{r}
+par(mfrow = c(2,2))
+plot(my_seq, UBCF_rmse_vector, type =  "b", xlab = "Minimum Number of ratings", ylab ="RMSE", main = "UBCF sensitivity to number of ratings threshold", col = "blue")
+plot(my_seq, IBCF_rmse_vector, type =  "b", xlab = "Minimum Number of ratings", ylab ="RMSE", main = "IBCF sensitivity to number of ratings threshold", col = "green")
+plot(my_seq, LIBMF_rmse_vector, type =  "b", xlab = "Minimum Number of ratings", ylab ="RMSE", main = "LIBMF sensitivity to number of ratings threshold", col = "red")
+```
+
+
+
+#comment on the pro and cons of every method
+#do a hockey stick for the performance of each model 
+# validate the pro and cons using the data 
+
+## Example
+
+movie_ratings[410,]
+recommended.items.u410<- predict(Rec.model, movie_ratings[410,], n=5)
+as(recommended.items.u410, "list")[[1]]
+
+
+
+#For the conclusion regarding the evaluation, there is a point to make that just assessing statistical rigor is not great. For instance, 
